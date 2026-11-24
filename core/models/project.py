@@ -22,6 +22,75 @@ from core.models.shot import Shot
 from core.timecode import normalize_shot_id, split_shot_id
 
 
+_WIN_DRIVE_ABS_RE = re.compile(r"^[A-Za-z]:[/\\]")
+_THUMBNAILS_SEG_RE = re.compile(r"(?:^|[/\\])(_thumbnails[/\\].+)$", re.IGNORECASE)
+
+
+def _is_any_os_abs(path: str) -> bool:
+    """Returns True if `path` is an absolute path on Windows (drive/UNC) or POSIX."""
+    p = (path or "").strip()
+    if not p:
+        return False
+    return bool(p.startswith("/") or p.startswith("\\\\") or _WIN_DRIVE_ABS_RE.match(p))
+
+
+def to_relative_project_path(vfx_root: str, path: str) -> str:
+    """
+    Converts a project-local file path (e.g. shot thumbnail) into a portable
+    POSIX-style relative path (e.g. '_thumbnails/HOH_0020.png') for project.json.
+    """
+    raw = (path or "").strip()
+    if not raw:
+        return ""
+    if not _is_any_os_abs(raw):
+        parts = [seg for seg in re.split(r"[/\\]+", raw) if seg and seg != "."]
+        return "/".join(parts)
+
+    if vfx_root and os.path.isabs(raw):
+        try:
+            rel = os.path.relpath(os.path.normpath(raw), os.path.normpath(vfx_root))
+            if rel and not rel.startswith("..") and not os.path.isabs(rel):
+                return rel.replace("\\", "/")
+        except ValueError:
+            pass
+
+    # Fallback for foreign-machine/cross-OS absolute paths pointing into _thumbnails/
+    m = _THUMBNAILS_SEG_RE.search(raw)
+    if m:
+        parts = [seg for seg in re.split(r"[/\\]+", m.group(1)) if seg and seg != "."]
+        return "/".join(parts)
+    return raw
+
+
+def resolve_shot_thumb_path(vfx_root: str, raw_thumb: str) -> str:
+    """
+    Resolves a stored shot thumbnail path (relative POSIX path or legacy absolute path
+    from another drive/OS) into a normalized local path under `vfx_root`.
+    """
+    raw = (raw_thumb or "").strip()
+    if not raw:
+        return ""
+    if not vfx_root:
+        return os.path.normpath(raw)
+
+    # Portable relative path (e.g. '_thumbnails/HOH_0020.png')
+    if not _is_any_os_abs(raw):
+        parts = [seg for seg in re.split(r"[/\\]+", raw) if seg and seg != "."]
+        return os.path.normpath(os.path.join(vfx_root, *parts)) if parts else ""
+
+    # Legacy absolute path inside _thumbnails/ (possibly from another drive letter or OS)
+    m = _THUMBNAILS_SEG_RE.search(raw)
+    if m:
+        parts = [seg for seg in re.split(r"[/\\]+", m.group(1)) if seg and seg != "."]
+        if parts:
+            return os.path.normpath(os.path.join(vfx_root, *parts))
+
+    # External absolute path: keep only if it exists locally, otherwise clear so canonical fallback works
+    if os.path.isabs(raw) and os.path.isfile(raw):
+        return os.path.normpath(raw)
+    return ""
+
+
 def infer_project_name_from_path(root_dir: str) -> str:
     """Infer a sensible default project name from a VFX root path (e.g. H:/MyShow/05_vfx -> MyShow)."""
     if not root_dir:
@@ -381,6 +450,15 @@ class Project:
             self.media_metadata.pop(media_key, None)
 
     def to_dict(self) -> Dict[str, Any]:
+        sequences_dict: Dict[str, Any] = {}
+        for k in sorted(self.sequences.keys()):
+            seq_dict = self.sequences[k].to_dict()
+            if isinstance(seq_dict.get("shots"), list):
+                for sh_dict in seq_dict["shots"]:
+                    if isinstance(sh_dict, dict) and sh_dict.get("thumb"):
+                        sh_dict["thumb"] = to_relative_project_path(self.vfx_root, str(sh_dict["thumb"]))
+            sequences_dict[k] = seq_dict
+
         data: Dict[str, Any] = {
             "name": self.name,
             "root_dir": self.root_dir,
@@ -398,7 +476,7 @@ class Project:
             "shot_custom_fields": list(self.shot_custom_fields),
             "shot_properties": [p.to_dict() for p in self.shot_properties],
             "artists": [a.to_dict() for a in self.list_artists()],
-            "sequences": {k: self.sequences[k].to_dict() for k in sorted(self.sequences.keys())},
+            "sequences": sequences_dict,
         }
         if self.media_metadata:
             data["media_metadata"] = {
@@ -466,7 +544,7 @@ class Project:
         if isinstance(raw_ignored, list):
             ignored_shots = sorted({normalize_shot_id(str(s)) for s in raw_ignored if str(s).strip()})
 
-        return cls(
+        project = cls(
             root_dir=root_dir or data.get("root_dir", ""),
             name=data.get("name", ""),
             fps=float(data.get("fps", 24.0)),
@@ -487,3 +565,8 @@ class Project:
             media_metadata=media_metadata,
             ignored_shots=ignored_shots,
         )
+        if project.vfx_root:
+            for sh in project.all_shots():
+                if sh.thumb:
+                    sh.thumb = resolve_shot_thumb_path(project.vfx_root, sh.thumb)
+        return project

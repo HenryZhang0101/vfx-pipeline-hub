@@ -239,6 +239,12 @@ class _ThumbnailWorkerThread(QThread):
                 _, project, repo, shot, force, media_dict = job
                 out_expected = get_shot_thumbnail_path(project, shot.shot_id)
                 if not force and out_expected and os.path.isfile(out_expected) and os.path.getsize(out_expected) > 0:
+                    cur_thumb = os.path.normcase(os.path.normpath(shot.thumb)) if shot.thumb else ""
+                    exp_thumb = os.path.normcase(os.path.normpath(out_expected))
+                    if cur_thumb != exp_thumb:
+                        shot.thumb = out_expected
+                        if not self._is_stale(gen, m_gen, kind):
+                            self.shot_thumbnail_ready.emit(shot.shot_id, out_expected)
                     return
                 out = generate_shot_thumbnail(
                     project, repo, shot, force=force, media_dict=media_dict

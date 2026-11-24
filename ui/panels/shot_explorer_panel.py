@@ -28,6 +28,7 @@ from qtpy.QtWidgets import (
 from config import DEFAULT_STATUSES
 from core.io.google_sheets import get_status_counts
 from core.models import Project, PropertyType, Shot, ShotProperty
+from core.models.project import resolve_shot_thumb_path
 from core.storage import ProjectRepository
 from tools import ToolRegistry
 from ui.theme import get_active_stylesheet
@@ -78,6 +79,11 @@ class ShotTableModel(QAbstractTableModel):
         self._shots = list(shots or [])
         self._visible_props = list(visible_props or [])
         self._thumb_dir = thumb_dir or ""
+        if self._thumb_dir:
+            vfx_root = os.path.dirname(os.path.normpath(self._thumb_dir))
+            for s in self._shots:
+                if s.thumb:
+                    s.thumb = resolve_shot_thumb_path(vfx_root, s.thumb)
         self._notes_col = 3 + len(self._visible_props)
         self._row_by_id = {s.shot_id: idx for idx, s in enumerate(self._shots)}
         self._haystacks = [self._build_haystack(s) for s in self._shots]
