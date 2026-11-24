@@ -1,11 +1,12 @@
 """Embeddable Media Ingest widget for Project Manager, MediaIngestDialog, and Resolve UI."""
 
+import copy
 import os
+import threading
 from typing import Any, Dict, List, Optional
 
-from qtpy.QtCore import Signal
+from qtpy.QtCore import QThread, QTimer, Signal
 from qtpy.QtWidgets import (
-    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -27,6 +28,120 @@ from core.models import Project
 from core.storage import ProjectRepository
 from core.thumbnails import generate_media_thumbnail, generate_shot_thumbnail, get_shot_thumbnail_path
 from core.timecode import format_shot_id, split_shot_id
+from ui.widgets.thumbnail_worker import clear_thumbnail_pixmap_cache
+
+
+class _SourceAnalyzeWorker(QThread):
+    """Background worker that probes a media source path without freezing the UI."""
+
+    analysis_finished = Signal(int, dict)  # generation_id, info_dict
+
+    def __init__(self, ingester, path: str, generation_id: int, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.ingester = ingester
+        self.path = path
+        self.generation_id = generation_id
+
+    def run(self) -> None:
+        try:
+            info = self.ingester.analyze_source(self.path)
+        except Exception as e:
+            info = {"valid": False, "error": str(e)}
+        self.analysis_finished.emit(self.generation_id, info)
+
+
+class _MediaIngestWorker(QThread):
+    """Background worker for copying/hardlinking media and generating thumbnails."""
+
+    progress_changed = Signal(int, int, str)  # done, total, status_text
+    finished_ingest = Signal(bool, str, str, list, bool)  # ok, msg, target_dir, thumb_paths, cancelled
+
+    def __init__(
+        self,
+        ingester,
+        project: Project,
+        repo: ProjectRepository,
+        seq: str,
+        shot: str,
+        norm_id: str,
+        source_info: Dict[str, Any],
+        category: str,
+        identifier: str,
+        version: str,
+        mode: str,
+        renumber: bool,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.ingester = ingester
+        self.project = project
+        self.repo = repo
+        self.seq = seq
+        self.shot = shot
+        self.norm_id = norm_id
+        self.source_info = copy.deepcopy(source_info)
+        self.category = category
+        self.identifier = identifier
+        self.version = version
+        self.mode = mode
+        self.renumber = renumber
+        self._cancel_event = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel_event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    def run(self) -> None:
+        def _on_prog(done: int, total: int, label: str) -> None:
+            self.progress_changed.emit(done, total, label)
+
+        ok, msg, target_dir = self.ingester.ingest_to_shot(
+            vfx_root=self.project.vfx_root,
+            seq=self.seq,
+            shot=self.shot,
+            source_info=self.source_info,
+            category=self.category,
+            identifier=self.identifier,
+            version=self.version,
+            mode=self.mode,
+            renumber_to_start_frame=self.renumber,
+            target_start_frame=DEFAULT_START_FRAME,
+            progress_callback=_on_prog,
+            cancel_check=self._cancel_event.is_set,
+        )
+
+        thumb_paths: List[str] = []
+        if ok and not self._cancel_event.is_set():
+            self.progress_changed.emit(1000, 1000, "Generating thumbnails...")
+            try:
+                inspected = self.repo.inspect_media_folder(target_dir)
+                if inspected and inspected.get("is_playable"):
+                    media_rec = {
+                        "shot_id": self.norm_id,
+                        "category": self.category,
+                        "identifier": self.identifier,
+                        "version": self.version,
+                        "version_dir": os.path.normpath(target_dir),
+                        **inspected,
+                    }
+                    media_thumb = generate_media_thumbnail(self.project, media_rec, force=True)
+                    if media_thumb:
+                        thumb_paths.append(media_thumb)
+                    sh_obj = self.project.get_shot(self.norm_id)
+                    if sh_obj:
+                        shot_png = get_shot_thumbnail_path(self.project, self.norm_id)
+                        if not shot_png or not os.path.isfile(shot_png):
+                            gen_shot_png = generate_shot_thumbnail(
+                                self.project, self.repo, sh_obj, force=True, media_dict=media_rec
+                            )
+                            if gen_shot_png:
+                                thumb_paths.append(gen_shot_png)
+            except Exception as e:
+                print(f"Warning generating thumbnail after ingest: {e}")
+
+        self.finished_ingest.emit(ok, msg, target_dir, thumb_paths, self._cancel_event.is_set())
 
 
 class MediaIngestWidget(QWidget):
@@ -35,7 +150,9 @@ class MediaIngestWidget(QWidget):
     Can be hosted inside MediaIngestDialog or embedded directly in a DaVinci Resolve UI.
     """
 
+    ingest_started = Signal()
     ingest_completed = Signal(str, str)  # (shot_id, target_dir)
+    ingest_finished = Signal(bool, str, str, str)  # (ok, shot_id, target_dir, message)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -45,6 +162,15 @@ class MediaIngestWidget(QWidget):
         self.shot_ids: List[str] = []
         self.source_info: Dict[str, Any] = {}
         self.ingested_shot_id = ""
+        self._analyze_gen = 0
+        self._analyze_worker: Optional[_SourceAnalyzeWorker] = None
+        self._ingest_worker: Optional[_MediaIngestWorker] = None
+        self._pending_ingest_meta: Dict[str, Any] = {}
+
+        self._analyze_timer = QTimer(self)
+        self._analyze_timer.setSingleShot(True)
+        self._analyze_timer.setInterval(180)
+        self._analyze_timer.timeout.connect(self._start_source_analysis)
 
         self._build_ui()
 
@@ -54,8 +180,8 @@ class MediaIngestWidget(QWidget):
         layout.setSpacing(10)
 
         # 1. Source Selection
-        src_grp = QGroupBox("Source")
-        src_grid = QGridLayout(src_grp)
+        self.src_grp = QGroupBox("Source")
+        src_grid = QGridLayout(self.src_grp)
 
         src_grid.addWidget(QLabel("Path:"), 0, 0)
         self.src_edit = QLineEdit()
@@ -74,11 +200,11 @@ class MediaIngestWidget(QWidget):
         self.src_summary_lbl = QLabel("")
         self.src_summary_lbl.setWordWrap(True)
         src_grid.addWidget(self.src_summary_lbl, 1, 0, 1, 4)
-        layout.addWidget(src_grp)
+        layout.addWidget(self.src_grp)
 
         # 2. Target Shot & Routing
-        tgt_grp = QGroupBox("Target & Routing")
-        tgt_grid = QGridLayout(tgt_grp)
+        self.tgt_grp = QGroupBox("Target & Routing")
+        tgt_grid = QGridLayout(self.tgt_grp)
 
         mode_row = QHBoxLayout()
         self.existing_radio = QRadioButton("Existing Shot")
@@ -127,7 +253,11 @@ class MediaIngestWidget(QWidget):
         self.update_range_chk.setChecked(True)
         tgt_grid.addWidget(self.update_range_chk, 8, 0, 1, 2)
 
-        layout.addWidget(tgt_grp)
+        layout.addWidget(self.tgt_grp)
+
+        self.status_lbl = QLabel("")
+        self.status_lbl.setVisible(False)
+        layout.addWidget(self.status_lbl)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
@@ -209,7 +339,33 @@ class MediaIngestWidget(QWidget):
     def _on_source_changed(self, path_text: str):
         if not self.ingester:
             return
-        info = self.ingester.analyze_source(path_text.strip())
+        raw = path_text.strip()
+        self._analyze_gen += 1
+        if not raw:
+            self._analyze_timer.stop()
+            self.source_info = {}
+            self.src_summary_lbl.setText("")
+            self.specs_edit.clear()
+            return
+        self.src_summary_lbl.setText("Inspecting source...")
+        self._analyze_timer.start()
+
+    def _start_source_analysis(self):
+        if not self.ingester:
+            return
+        raw = self.src_edit.text().strip()
+        if not raw:
+            return
+        gen = self._analyze_gen
+        worker = _SourceAnalyzeWorker(self.ingester, raw, gen, self)
+        worker.analysis_finished.connect(self._on_source_analysis_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._analyze_worker = worker
+        worker.start()
+
+    def _on_source_analysis_finished(self, gen: int, info: Dict[str, Any]):
+        if gen != self._analyze_gen:
+            return
         self.source_info = info
         if not info.get("valid"):
             self.src_summary_lbl.setText(info.get("error", ""))
@@ -262,8 +418,22 @@ class MediaIngestWidget(QWidget):
             next_v = self.repo.get_next_media_version(self.project, norm_id, cat_key, ident)
             self.ver_edit.setText(next_v)
 
-    def run_ingest(self) -> bool:
-        """Execute ingestion. Returns True on success."""
+    def is_ingesting(self) -> bool:
+        return bool(self._ingest_worker and self._ingest_worker.isRunning())
+
+    def cancel_ingest(self) -> None:
+        if self._ingest_worker and self._ingest_worker.isRunning():
+            self._ingest_worker.request_cancel()
+            self.status_lbl.setText("Cancelling ingestion...")
+
+    def _set_busy(self, busy: bool) -> None:
+        self.src_grp.setEnabled(not busy)
+        self.tgt_grp.setEnabled(not busy)
+
+    def start_ingest(self) -> bool:
+        """Validate inputs and start asynchronous media ingestion. Returns True if worker started."""
+        if self.is_ingesting():
+            return False
         if not self.project or not self.repo or not self.ingester:
             return False
         if not self.source_info.get("valid"):
@@ -292,71 +462,102 @@ class MediaIngestWidget(QWidget):
 
         self.repo.ensure_shot(self.project, norm_id, start_frame=s_frame)
 
+        self._pending_ingest_meta = {
+            "norm_id": norm_id,
+            "s_frame": s_frame,
+            "f_count": f_count,
+            "update_range": self.update_range_chk.isChecked(),
+            "source_info": copy.deepcopy(self.source_info),
+        }
+
+        self._set_busy(True)
+        self.status_lbl.setVisible(True)
+        self.status_lbl.setText("Starting ingestion...")
         self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(max(1, len(self.source_info.get("files", [])) or 1))
+        self.progress_bar.setMaximum(1000)
         self.progress_bar.setValue(0)
 
-        def on_prog(done: int, total: int, fname: str):
-            self.progress_bar.setValue(done)
-            QApplication.processEvents()
-
-        ok, msg, target_dir = self.ingester.ingest_to_shot(
-            vfx_root=self.project.vfx_root,
+        worker = _MediaIngestWorker(
+            ingester=self.ingester,
+            project=self.project,
+            repo=self.repo,
             seq=seq,
             shot=shot,
+            norm_id=norm_id,
             source_info=self.source_info,
             category=cat_key,
             identifier=ident,
             version=ver,
             mode=mode,
-            renumber_to_start_frame=renum,
-            target_start_frame=DEFAULT_START_FRAME,
-            progress_callback=on_prog,
+            renumber=renum,
+            parent=self,
         )
+        worker.progress_changed.connect(self._on_ingest_progress)
+        worker.finished_ingest.connect(self._on_ingest_worker_finished)
+        self._ingest_worker = worker
+        self.ingest_started.emit()
+        worker.start()
+        return True
 
-        if ok:
+    def run_ingest(self) -> bool:
+        """Backwards-compatible alias that starts non-blocking ingestion."""
+        return self.start_ingest()
+
+    def _on_ingest_progress(self, done: int, total: int, label: str) -> None:
+        if total > 0:
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(min(done, total))
+        if label:
+            self.status_lbl.setText(label)
+
+    def _on_ingest_worker_finished(
+        self,
+        ok: bool,
+        msg: str,
+        target_dir: str,
+        thumb_paths: List[str],
+        was_cancelled: bool,
+    ) -> None:
+        meta = self._pending_ingest_meta or {}
+        norm_id = meta.get("norm_id", "")
+        self._ingest_worker = None
+        self._set_busy(False)
+
+        if ok and self.project and self.repo:
             sh_obj = self.project.get_shot(norm_id)
-            if self.update_range_chk.isChecked() and sh_obj:
-                probed_fps = float(self.source_info.get("fps") or 0.0)
+            src_info = meta.get("source_info") or {}
+            s_frame = int(meta.get("s_frame", DEFAULT_START_FRAME))
+            f_count = int(meta.get("f_count", 1))
+            if meta.get("update_range") and sh_obj:
+                probed_fps = float(src_info.get("fps") or 0.0)
                 eff_fps = probed_fps if probed_fps > 0 else self.project.fps
                 sh_obj.start_frame = s_frame
                 if f_count > 1:
                     sh_obj.duration = f"{f_count} ({f_count / max(1.0, eff_fps):.2f}s)"
-                if self.source_info.get("resolution"):
-                    sh_obj.set_field("resolution", self.source_info["resolution"])
+                if src_info.get("resolution"):
+                    sh_obj.set_field("resolution", src_info["resolution"])
                 if probed_fps > 0:
                     sh_obj.fps = probed_fps
                 if not sh_obj.name or sh_obj.name == f"{norm_id}_plate":
-                    sh_obj.name = os.path.splitext(self.source_info.get("display_name", ""))[0] or f"{norm_id}_plate"
+                    sh_obj.name = os.path.splitext(src_info.get("display_name", ""))[0] or f"{norm_id}_plate"
 
-            # Auto-generate media thumbnail (and shot thumbnail if missing)
-            try:
-                inspected = self.repo.inspect_media_folder(target_dir)
-                if inspected and inspected.get("is_playable"):
-                    media_rec = {
-                        "shot_id": norm_id,
-                        "category": cat_key,
-                        "identifier": ident,
-                        "version": ver,
-                        "version_dir": os.path.normpath(target_dir),
-                        **inspected,
-                    }
-                    generate_media_thumbnail(self.project, media_rec, force=True)
-                    if sh_obj:
-                        shot_png = get_shot_thumbnail_path(self.project, norm_id)
-                        if not shot_png or not os.path.isfile(shot_png):
-                            generate_shot_thumbnail(
-                                self.project, self.repo, sh_obj, force=True, media_dict=media_rec
-                            )
-            except Exception as e:
-                print(f"Warning generating thumbnail after ingest: {e}")
+            for tp in thumb_paths:
+                clear_thumbnail_pixmap_cache(tp)
 
             if sh_obj:
                 self.repo.save(self.project)
             self.ingested_shot_id = norm_id
+            self.status_lbl.setText("Ingestion complete.")
             self.ingest_completed.emit(norm_id, target_dir)
             QMessageBox.information(self, "Ingestion Complete", f"{msg}\n\n{target_dir}")
-            return True
+            self.ingest_finished.emit(True, norm_id, target_dir, msg)
+            return
 
+        if was_cancelled:
+            self.status_lbl.setText("Ingestion cancelled.")
+            self.ingest_finished.emit(False, norm_id, target_dir, msg)
+            return
+
+        self.status_lbl.setText("Ingestion failed.")
         QMessageBox.warning(self, "Ingestion Failed", msg)
-        return False
+        self.ingest_finished.emit(False, norm_id, target_dir, msg)

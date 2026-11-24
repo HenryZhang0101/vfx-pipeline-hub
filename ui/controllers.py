@@ -360,8 +360,8 @@ def open_send_to_client_dialog(
     clips: List[Dict[str, Any]],
     initial_mode: str = "qt_review",
     repo: Optional[ProjectRepository] = None,
-) -> None:
-    """Open the unified Send to Client (BatchQTExportDialog) window."""
+) -> Any:
+    """Open the unified Send to Client (BatchQTExportDialog) window non-modally."""
     from config import DEFAULT_EXPORT_FOLDER
     from ui.dialogs.batch_qt_export_dialog import BatchQTExportDialog
 
@@ -377,7 +377,19 @@ def open_send_to_client_dialog(
         project=project,
         repo=repo,
     )
-    dlg.exec_()
+    dlg.setWindowModality(Qt.NonModal)
+    dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+    if parent is not None:
+        open_dialogs = getattr(parent, "_open_tool_dialogs", None)
+        if open_dialogs is None:
+            open_dialogs = []
+            setattr(parent, "_open_tool_dialogs", open_dialogs)
+        open_dialogs.append(dlg)
+        dlg.destroyed.connect(lambda _=None, d=dlg: open_dialogs.remove(d) if d in open_dialogs else None)
+    dlg.show()
+    dlg.raise_()
+    dlg.activateWindow()
+    return dlg
 
 
 def save_project_session(project: Project, repo: ProjectRepository, write_excel: bool = True) -> str:

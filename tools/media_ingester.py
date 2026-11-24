@@ -230,6 +230,50 @@ class MediaIngesterTool(BaseToolPlugin):
 
         return {"valid": False, "error": "Unsupported source path."}
 
+    @staticmethod
+    def _copy_file_chunked(
+        src_path: str,
+        dst_path: str,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        on_chunk: Optional[Callable[[int], None]] = None,
+        chunk_size: int = 4 * 1024 * 1024,
+    ) -> bool:
+        """
+        Copy a file in chunks so progress can be reported mid-file and large copies can be
+        cancelled immediately without leaving partial destination files behind.
+        Returns False if cancelled, True on completion.
+        """
+        try:
+            with open(src_path, "rb") as fsrc, open(dst_path, "wb") as fdst:
+                while True:
+                    if cancel_check and cancel_check():
+                        break
+                    buf = fsrc.read(chunk_size)
+                    if not buf:
+                        break
+                    fdst.write(buf)
+                    if on_chunk:
+                        on_chunk(len(buf))
+            if cancel_check and cancel_check():
+                try:
+                    if os.path.exists(dst_path):
+                        os.remove(dst_path)
+                except OSError:
+                    pass
+                return False
+            try:
+                shutil.copystat(src_path, dst_path)
+            except OSError:
+                pass
+            return True
+        except Exception:
+            try:
+                if os.path.exists(dst_path):
+                    os.remove(dst_path)
+            except OSError:
+                pass
+            raise
+
     def ingest_to_shot(
         self,
         vfx_root: str,
@@ -243,6 +287,7 @@ class MediaIngesterTool(BaseToolPlugin):
         renumber_to_start_frame: bool = True,
         target_start_frame: int = DEFAULT_START_FRAME,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Tuple[bool, str, str]:
         """
         Executes media/asset ingestion into the target shot folder.
@@ -272,8 +317,37 @@ class MediaIngesterTool(BaseToolPlugin):
             ext: str = source_info.get("ext", ".exr")
             total = len(files)
 
+            existing_files = [f for f in files if os.path.isfile(f)]
+            total_bytes = 0
+            for f in existing_files:
+                try:
+                    total_bytes += os.path.getsize(f)
+                except OSError:
+                    pass
+            copied_bytes = 0
+            last_permille = -1
+
+            def _emit_byte_progress(dst_name: str, file_idx: int) -> None:
+                nonlocal last_permille
+                if not progress_callback:
+                    return
+                if total_bytes > 0:
+                    permille = min(1000, int((copied_bytes * 1000) // total_bytes))
+                    if permille != last_permille:
+                        last_permille = permille
+                        pct = permille // 10
+                        if total > 1:
+                            label = f"Copying {file_idx + 1}/{total}: {dst_name} ({pct}%)"
+                        else:
+                            label = f"Copying {dst_name} ({pct}%)"
+                        progress_callback(permille, 1000, label)
+                elif file_idx % 5 == 0 or file_idx == total - 1:
+                    progress_callback(file_idx + 1, max(1, total), dst_name)
+
             norm_id = format_shot_id(seq, shot)
             for idx, src_file in enumerate(files):
+                if cancel_check and cancel_check():
+                    return False, "Ingestion cancelled.", os.path.normpath(target_dir)
                 if not os.path.isfile(src_file):
                     continue
 
@@ -293,17 +367,40 @@ class MediaIngesterTool(BaseToolPlugin):
                 if os.path.exists(dst_path):
                     os.remove(dst_path)
 
+                used_hardlink = False
                 if mode == "hardlink":
                     try:
                         os.link(src_file, dst_path)
+                        used_hardlink = True
                     except OSError:
-                        # Cross-drive fallback to copy2
-                        shutil.copy2(src_file, dst_path)
-                else:
-                    shutil.copy2(src_file, dst_path)
+                        used_hardlink = False
 
-                if progress_callback and (idx % 5 == 0 or idx == total - 1):
-                    progress_callback(idx + 1, total, dst_name)
+                if used_hardlink:
+                    try:
+                        copied_bytes += os.path.getsize(src_file)
+                    except OSError:
+                        pass
+                    if progress_callback and (idx % 5 == 0 or idx == total - 1):
+                        if total_bytes > 0:
+                            permille = min(1000, int((copied_bytes * 1000) // total_bytes))
+                            progress_callback(permille, 1000, f"Hardlinking {idx + 1}/{total}: {dst_name}")
+                        else:
+                            progress_callback(idx + 1, max(1, total), dst_name)
+                else:
+                    def _on_chunk(n_bytes: int, _name: str = dst_name, _idx: int = idx) -> None:
+                        nonlocal copied_bytes
+                        copied_bytes += n_bytes
+                        _emit_byte_progress(_name, _idx)
+
+                    ok_copy = self._copy_file_chunked(
+                        src_file,
+                        dst_path,
+                        cancel_check=cancel_check,
+                        on_chunk=_on_chunk,
+                    )
+                    if not ok_copy:
+                        return False, "Ingestion cancelled.", os.path.normpath(target_dir)
+                    _emit_byte_progress(dst_name, idx)
 
             method_label = "Hardlinked" if mode == "hardlink" else "Copied"
             return (

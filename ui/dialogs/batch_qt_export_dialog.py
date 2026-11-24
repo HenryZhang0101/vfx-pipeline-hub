@@ -1,13 +1,15 @@
 """Batch & single-clip QuickTime Review (Slate + H.264) and Delivery (ProRes 4444) dialog."""
 
+import copy
 import os
-from typing import Any, Dict, List
+import tempfile
+import threading
+from typing import Any, Dict, List, Optional
 
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QThread, Signal
 from qtpy.QtGui import QColor, QFont, QPixmap
 from qtpy.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -30,6 +32,146 @@ from qtpy.QtWidgets import (
 
 from config import DEFAULT_EXPORT_FOLDER, open_path_in_os
 from ui.theme import get_active_stylesheet
+
+
+class _BatchQTExportWorker(QThread):
+    """Background worker that encodes queued QuickTime clips without freezing the Qt UI."""
+
+    clip_started = Signal(int, str)  # row_idx, stem
+    clip_progress = Signal(int, int, int, str)  # row_idx, done_frames, total_frames, status_text
+    clip_finished = Signal(int, bool, str, str)  # row_idx, ok, msg, clip_out_dir
+    batch_finished = Signal(int, int, list, list, bool)  # success_count, total, errors, exported_dirs, cancelled
+
+    def __init__(
+        self,
+        slate_tool,
+        clips: List[Dict[str, Any]],
+        mode: str,
+        include_slate: bool,
+        ext: str,
+        out_dir: str,
+        use_shot_subfolder: bool,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.slate_tool = slate_tool
+        self.clips = [copy.deepcopy(c) for c in clips]
+        self.mode = mode
+        self.include_slate = include_slate
+        self.ext = ext
+        self.out_dir = out_dir
+        self.use_shot_subfolder = use_shot_subfolder
+        self._cancel_event = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel_event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    def run(self) -> None:
+        success_count = 0
+        errors: List[str] = []
+        exported_dirs: List[str] = []
+        total = len(self.clips)
+
+        for idx, clip in enumerate(self.clips):
+            if self._cancel_event.is_set():
+                break
+
+            shot_id_folder = (clip.get("shot_id") or "").strip() or "SHOT"
+            if (
+                self.use_shot_subfolder
+                and os.path.basename(os.path.normpath(self.out_dir)).lower() != shot_id_folder.lower()
+            ):
+                clip_out_dir = os.path.join(self.out_dir, shot_id_folder)
+            else:
+                clip_out_dir = self.out_dir
+
+            try:
+                os.makedirs(clip_out_dir, exist_ok=True)
+            except OSError as e:
+                stem = (clip.get("output_name") or "").strip() or shot_id_folder
+                errors.append(f"{stem}: {e}")
+                self.clip_finished.emit(idx, False, str(e), clip_out_dir)
+                continue
+
+            stem = (clip.get("output_name") or "").strip() or f"{shot_id_folder}_{clip.get('version', 'v0001')}"
+            stem = os.path.splitext(stem)[0]
+            out_path = os.path.join(clip_out_dir, f"{stem}{self.ext}")
+
+            self.clip_started.emit(idx, stem)
+
+            def _on_prog(done_f: int, total_f: int, status_text: str, _idx: int = idx) -> None:
+                self.clip_progress.emit(_idx, done_f, total_f, status_text)
+
+            try:
+                ok, msg = self.slate_tool.export_clip_qt(
+                    clip_info=clip,
+                    output_path=out_path,
+                    mode=self.mode,
+                    include_slate=self.include_slate,
+                    cancel_check=self._cancel_event.is_set,
+                    progress_callback=_on_prog,
+                )
+            except Exception as e:
+                ok, msg = False, str(e)
+
+            if self._cancel_event.is_set() and not ok:
+                self.clip_finished.emit(idx, False, "Cancelled", clip_out_dir)
+                break
+
+            if ok:
+                success_count += 1
+                if clip_out_dir not in exported_dirs:
+                    exported_dirs.append(clip_out_dir)
+                self.clip_finished.emit(idx, True, msg, clip_out_dir)
+            else:
+                errors.append(f"{stem}: {msg}")
+                self.clip_finished.emit(idx, False, msg, clip_out_dir)
+
+        self.batch_finished.emit(success_count, total, errors, exported_dirs, self._cancel_event.is_set())
+
+
+class _SlatePreviewWorker(QThread):
+    """Background worker for rendering the Frame 1000 VFX Slate preview PNG."""
+
+    preview_ready = Signal(str)
+    preview_failed = Signal(str)
+
+    def __init__(self, slate_tool, clip: Dict[str, Any], out_png: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.slate_tool = slate_tool
+        self.clip = copy.deepcopy(clip)
+        self.out_png = out_png
+
+    def run(self) -> None:
+        try:
+            self.slate_tool.generate_slate_preview_png(self.clip, self.out_png)
+            self.preview_ready.emit(self.out_png)
+        except Exception as e:
+            self.preview_failed.emit(str(e))
+
+
+class _ExternalClipInspectWorker(QThread):
+    """Background worker for inspecting externally browsed clips via ffprobe."""
+
+    inspection_finished = Signal(list, list)  # clips, errors
+
+    def __init__(self, slate_tool, paths: List[str], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.slate_tool = slate_tool
+        self.paths = list(paths)
+
+    def run(self) -> None:
+        infos: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        for path in self.paths:
+            try:
+                infos.append(self.slate_tool.inspect_clip_source(path))
+            except Exception as e:
+                errors.append(f"{os.path.basename(path)}: {e}")
+        self.inspection_finished.emit(infos, errors)
 
 
 class BatchQTExportDialog(QDialog):
@@ -66,6 +208,11 @@ class BatchQTExportDialog(QDialog):
         self._custom_out_dir_chosen = False
         self._updating_row = False
         self._preview_png_path = ""
+        self._export_worker: Optional[_BatchQTExportWorker] = None
+        self._preview_worker: Optional[_SlatePreviewWorker] = None
+        self._inspect_worker: Optional[_ExternalClipInspectWorker] = None
+        self._active_out_dir: str = ""
+        self._close_after_cancel = False
 
         self.setWindowTitle(
             "Generate QT Review (Slate + H.264) / QT Delivery (ProRes 4444)"
@@ -77,8 +224,8 @@ class BatchQTExportDialog(QDialog):
         root_layout.setSpacing(10)
 
         # 1. EXPORT MODE & DESTINATION BAR
-        top_grp = QGroupBox("1. Export Preset, Slate Options & Destination Folder")
-        top_grid = QGridLayout(top_grp)
+        self.top_grp = QGroupBox("1. Export Preset, Slate Options & Destination Folder")
+        top_grid = QGridLayout(self.top_grp)
 
         top_grid.addWidget(QLabel("Export Preset:"), 0, 0)
         self.mode_combo = QComboBox()
@@ -123,11 +270,11 @@ class BatchQTExportDialog(QDialog):
         open_out_btn.clicked.connect(self._on_open_out_dir)
         top_grid.addWidget(open_out_btn, 1, 4)
 
-        root_layout.addWidget(top_grp)
+        root_layout.addWidget(self.top_grp)
 
         # 2. BATCH CLIP RENAMER BAR
-        rename_grp = QGroupBox("2. Output Clip Renaming (Double-click 'Output Clip Name' in table or use Batch Pattern below)")
-        rename_layout = QHBoxLayout(rename_grp)
+        self.rename_grp = QGroupBox("2. Output Clip Renaming (Double-click 'Output Clip Name' in table or use Batch Pattern below)")
+        rename_layout = QHBoxLayout(self.rename_grp)
 
         rename_layout.addWidget(QLabel("Naming Pattern:"))
         self.pattern_combo = QComboBox()
@@ -165,11 +312,11 @@ class BatchQTExportDialog(QDialog):
         rename_layout.addWidget(replace_btn)
 
         rename_layout.addStretch()
-        add_file_btn = QPushButton("+ Add External Clip / Sequence...")
-        add_file_btn.clicked.connect(self._on_add_external_clip)
-        rename_layout.addWidget(add_file_btn)
+        self.add_file_btn = QPushButton("+ Add External Clip / Sequence...")
+        self.add_file_btn.clicked.connect(self._on_add_external_clip)
+        rename_layout.addWidget(self.add_file_btn)
 
-        root_layout.addWidget(rename_grp)
+        root_layout.addWidget(self.rename_grp)
 
         # 3. MAIN SPLITTER: CLIP TABLE (LEFT) + SLATE INSPECTOR & PREVIEW (RIGHT)
         mid_splitter = QSplitter(Qt.Horizontal)
@@ -210,8 +357,8 @@ class BatchQTExportDialog(QDialog):
         right_l = QVBoxLayout(right_w)
         right_l.setContentsMargins(0, 0, 0, 0)
 
-        meta_grp = QGroupBox("Selected Clip — Rename & Slate Metadata")
-        meta_grid = QGridLayout(meta_grp)
+        self.meta_grp = QGroupBox("Selected Clip — Rename & Slate Metadata")
+        meta_grid = QGridLayout(self.meta_grp)
 
         meta_grid.addWidget(QLabel("Output Filename:"), 0, 0)
         self.ed_output_name = QLineEdit()
@@ -246,7 +393,7 @@ class BatchQTExportDialog(QDialog):
         self.ed_colorspace.currentTextChanged.connect(lambda val: self._update_selected_clip_field("color_space", val))
         meta_grid.addWidget(self.ed_colorspace, 3, 1, 1, 3)
 
-        right_l.addWidget(meta_grp)
+        right_l.addWidget(self.meta_grp)
 
         prev_grp = QGroupBox("Frame 1000 VFX Slate Preview")
         prev_l = QVBoxLayout(prev_grp)
@@ -257,9 +404,9 @@ class BatchQTExportDialog(QDialog):
         self.preview_lbl.setStyleSheet("background-color: #0d0f12; border: 1px solid #2c313a; border-radius: 4px; color: #7f848e;")
         prev_l.addWidget(self.preview_lbl, 1)
 
-        prev_btn = QPushButton("🖼 Render Frame 1000 Slate Preview")
-        prev_btn.clicked.connect(self._on_render_slate_preview)
-        prev_l.addWidget(prev_btn)
+        self.prev_btn = QPushButton("🖼 Render Frame 1000 Slate Preview")
+        self.prev_btn.clicked.connect(self._on_render_slate_preview)
+        prev_l.addWidget(self.prev_btn)
 
         right_l.addWidget(prev_grp, 1)
         mid_splitter.addWidget(right_w)
@@ -279,16 +426,23 @@ class BatchQTExportDialog(QDialog):
         btn_row.addWidget(self.summary_lbl)
         btn_row.addStretch()
 
+        self.cancel_btn = QPushButton("Cancel Export")
+        self.cancel_btn.setObjectName("warn_btn")
+        self.cancel_btn.setMinimumHeight(34)
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self._on_cancel_batch_export)
+        btn_row.addWidget(self.cancel_btn)
+
         self.export_btn = QPushButton("🚀 Generate QuickTime(s)")
         self.export_btn.setObjectName("success_btn")
         self.export_btn.setMinimumHeight(34)
         self.export_btn.clicked.connect(self._on_run_batch_export)
         btn_row.addWidget(self.export_btn)
 
-        close_btn = QPushButton("Close")
-        close_btn.setMinimumHeight(34)
-        close_btn.clicked.connect(self.reject)
-        btn_row.addWidget(close_btn)
+        self.close_btn = QPushButton("Close")
+        self.close_btn.setMinimumHeight(34)
+        self.close_btn.clicked.connect(self.close)
+        btn_row.addWidget(self.close_btn)
 
         root_layout.addLayout(btn_row)
 
@@ -496,7 +650,22 @@ class BatchQTExportDialog(QDialog):
         self._updating_row = False
         self._on_clip_row_selected()
 
+    def _set_export_busy(self, busy: bool) -> None:
+        self.top_grp.setEnabled(not busy)
+        self.rename_grp.setEnabled(not busy)
+        self.meta_grp.setEnabled(not busy)
+        self.prev_btn.setEnabled(not busy)
+        self.export_btn.setEnabled(not busy)
+        self.cancel_btn.setVisible(busy)
+        self.cancel_btn.setEnabled(busy)
+        self.cancel_btn.setText("Cancel Export")
+        self.clip_table.setEditTriggers(
+            QAbstractItemView.NoEditTriggers if busy else QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed
+        )
+
     def _on_add_external_clip(self):
+        if self._inspect_worker and self._inspect_worker.isRunning():
+            return
         chosen, _ = QFileDialog.getOpenFileNames(
             self,
             "Select Video File(s) or First Frame of Image Sequence(s)",
@@ -505,36 +674,71 @@ class BatchQTExportDialog(QDialog):
         )
         if not chosen:
             return
-        for path in chosen:
-            info = self.slate_tool.inspect_clip_source(path)
-            self.clips.append(info)
-        self._populate_table()
+        self.add_file_btn.setEnabled(False)
+        self.summary_lbl.setText(f"Inspecting {len(chosen)} external clip(s)...")
+        worker = _ExternalClipInspectWorker(self.slate_tool, chosen, self)
+        worker.inspection_finished.connect(self._on_external_clips_inspected)
+        worker.finished.connect(self._cleanup_inspect_worker)
+        self._inspect_worker = worker
+        worker.start()
+
+    def _on_external_clips_inspected(self, infos: List[Dict[str, Any]], errors: List[str]):
+        if infos:
+            self.clips.extend(infos)
+            self._populate_table()
+        else:
+            self._update_mode_ui()
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Clip Inspection Error",
+                "Some clips could not be inspected:\n\n" + "\n".join(errors[:5]),
+            )
+
+    def _cleanup_inspect_worker(self):
+        self.add_file_btn.setEnabled(True)
+        self._inspect_worker = None
 
     def _on_render_slate_preview(self):
+        if self._preview_worker and self._preview_worker.isRunning():
+            return
         row = self.clip_table.currentRow()
         if row < 0 or row >= len(self.clips):
             return
         clip = self.clips[row]
         self.preview_lbl.setText("Rendering Frame 1000 Slate preview...")
-        QApplication.processEvents()
-        try:
-            import tempfile
-            out_png = os.path.join(tempfile.gettempdir(), f"vfx_slate_ui_preview_{row}.png")
-            self.slate_tool.generate_slate_preview_png(clip, out_png)
-            self._preview_png_path = out_png
-            pix = QPixmap(out_png)
-            if not pix.isNull():
-                scaled = pix.scaled(
-                    self.preview_lbl.size(),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation,
-                )
-                self.preview_lbl.setPixmap(scaled)
-        except Exception as e:
-            self.preview_lbl.setText(f"Preview Error:\n{e}")
+        self.prev_btn.setEnabled(False)
+        out_png = os.path.join(tempfile.gettempdir(), f"vfx_slate_ui_preview_{row}.png")
+        worker = _SlatePreviewWorker(self.slate_tool, clip, out_png, self)
+        worker.preview_ready.connect(self._on_slate_preview_ready)
+        worker.preview_failed.connect(self._on_slate_preview_failed)
+        worker.finished.connect(self._cleanup_preview_worker)
+        self._preview_worker = worker
+        worker.start()
+
+    def _on_slate_preview_ready(self, out_png: str):
+        self._preview_png_path = out_png
+        pix = QPixmap(out_png)
+        if not pix.isNull():
+            scaled = pix.scaled(
+                self.preview_lbl.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            self.preview_lbl.setPixmap(scaled)
+
+    def _on_slate_preview_failed(self, err_msg: str):
+        self.preview_lbl.setText(f"Preview Error:\n{err_msg}")
+
+    def _cleanup_preview_worker(self):
+        if not (self._export_worker and self._export_worker.isRunning()):
+            self.prev_btn.setEnabled(True)
+        self._preview_worker = None
 
     def _on_run_batch_export(self):
         if not self.clips:
+            return
+        if self._export_worker and self._export_worker.isRunning():
             return
         mode = self.mode_combo.currentData() or "qt_review"
         include_slate = self.include_slate_chk.isChecked()
@@ -546,63 +750,109 @@ class BatchQTExportDialog(QDialog):
 
         os.makedirs(out_dir, exist_ok=True)
         self._persist_export_folder_if_inside_project(out_dir)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(len(self.clips))
-        self.progress_bar.setValue(0)
-        self.export_btn.setEnabled(False)
+        self._active_out_dir = out_dir
+        self._close_after_cancel = False
 
-        success_count = 0
-        errors: List[str] = []
-        exported_dirs: List[str] = []
-
-        for idx, clip in enumerate(self.clips):
-            st_item = self.clip_table.item(idx, 6)
+        for r_idx in range(self.clip_table.rowCount()):
+            st_item = self.clip_table.item(r_idx, 6)
             if st_item:
-                st_item.setText("⏳ Encoding...")
-                st_item.setForeground(QColor("#e5c07b"))
-            self.clip_table.selectRow(idx)
-            QApplication.processEvents()
+                st_item.setText("Queued")
+                st_item.setForeground(QColor("#61afef"))
 
-            shot_id_folder = clip.get("shot_id", "").strip() or "SHOT"
-            if self.shot_subfolder_chk.isChecked() and os.path.basename(os.path.normpath(out_dir)).lower() != shot_id_folder.lower():
-                clip_out_dir = os.path.join(out_dir, shot_id_folder)
-            else:
-                clip_out_dir = out_dir
-            os.makedirs(clip_out_dir, exist_ok=True)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(max(1, len(self.clips) * 100))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+        self._set_export_busy(True)
+        self.summary_lbl.setText(f"Starting export of {len(self.clips)} clip(s)...")
 
-            stem = clip.get("output_name", "").strip() or f"{shot_id_folder}_{clip.get('version', 'v0001')}"
-            stem = os.path.splitext(stem)[0]
-            out_path = os.path.join(clip_out_dir, f"{stem}{ext}")
+        worker = _BatchQTExportWorker(
+            slate_tool=self.slate_tool,
+            clips=self.clips,
+            mode=mode,
+            include_slate=include_slate,
+            ext=ext,
+            out_dir=out_dir,
+            use_shot_subfolder=self.shot_subfolder_chk.isChecked(),
+            parent=self,
+        )
+        worker.clip_started.connect(self._on_export_clip_started)
+        worker.clip_progress.connect(self._on_export_clip_progress)
+        worker.clip_finished.connect(self._on_export_clip_finished)
+        worker.batch_finished.connect(self._on_export_batch_finished)
+        self._export_worker = worker
+        worker.start()
 
-            ok, msg = self.slate_tool.export_clip_qt(
-                clip_info=clip,
-                output_path=out_path,
-                mode=mode,
-                include_slate=include_slate,
-            )
+    def _on_cancel_batch_export(self):
+        if self._export_worker and self._export_worker.isRunning():
+            self._export_worker.request_cancel()
+            self.cancel_btn.setEnabled(False)
+            self.cancel_btn.setText("Cancelling...")
+            self.summary_lbl.setText("Cancelling active export...")
+
+    def _on_export_clip_started(self, idx: int, stem: str):
+        st_item = self.clip_table.item(idx, 6)
+        if st_item:
+            st_item.setText("⏳ Encoding...")
+            st_item.setForeground(QColor("#e5c07b"))
+        self.clip_table.selectRow(idx)
+        self.summary_lbl.setText(f"Encoding clip {idx + 1}/{len(self.clips)}: {stem}")
+
+    def _on_export_clip_progress(self, idx: int, done_f: int, total_f: int, status_text: str):
+        st_item = self.clip_table.item(idx, 6)
+        if st_item:
+            st_item.setText(f"⏳ {status_text}")
+            st_item.setForeground(QColor("#e5c07b"))
+        if total_f > 0:
+            clip_pct = min(99, int(round((done_f / total_f) * 100)))
+            self.progress_bar.setValue(idx * 100 + clip_pct)
+
+    def _on_export_clip_finished(self, idx: int, ok: bool, msg: str, _clip_out_dir: str):
+        st_item = self.clip_table.item(idx, 6)
+        if st_item:
             if ok:
-                success_count += 1
-                if clip_out_dir not in exported_dirs:
-                    exported_dirs.append(clip_out_dir)
-                if st_item:
-                    st_item.setText("✅ Done")
-                    st_item.setForeground(QColor("#98c379"))
+                st_item.setText("✅ Done")
+                st_item.setForeground(QColor("#98c379"))
+            elif msg == "Cancelled":
+                st_item.setText("⛔ Cancelled")
+                st_item.setForeground(QColor("#9b9a97"))
             else:
-                errors.append(f"{stem}: {msg}")
-                if st_item:
-                    st_item.setText("❌ Failed")
-                    st_item.setForeground(QColor("#e06c75"))
+                st_item.setText("❌ Failed")
+                st_item.setForeground(QColor("#e06c75"))
+        self.progress_bar.setValue((idx + 1) * 100)
 
-            self.progress_bar.setValue(idx + 1)
-            QApplication.processEvents()
+    def _on_export_batch_finished(
+        self,
+        success_count: int,
+        total_count: int,
+        errors: List[str],
+        exported_dirs: List[str],
+        was_cancelled: bool,
+    ):
+        self._set_export_busy(False)
+        self._export_worker = None
 
-        self.export_btn.setEnabled(True)
-        open_target_dir = exported_dirs[0] if len(exported_dirs) == 1 else out_dir
+        if self._close_after_cancel:
+            self._close_after_cancel = False
+            self.close()
+            return
+
+        open_target_dir = exported_dirs[0] if len(exported_dirs) == 1 else self._active_out_dir
+        if was_cancelled:
+            self.summary_lbl.setText(f"Export cancelled ({success_count}/{total_count} completed).")
+            QMessageBox.information(
+                self,
+                "Export Cancelled",
+                f"Batch export was cancelled.\n\nCompleted {success_count}/{total_count} clip(s).",
+            )
+            return
+
+        self._update_mode_ui()
         if errors:
             QMessageBox.warning(
                 self,
                 "Batch Export Completed with Errors",
-                f"Exported {success_count}/{len(self.clips)} clip(s) to:\n{open_target_dir}\n\nErrors:\n" + "\n\n".join(errors[:3]),
+                f"Exported {success_count}/{total_count} clip(s) to:\n{open_target_dir}\n\nErrors:\n" + "\n\n".join(errors[:3]),
             )
         else:
             reply = QMessageBox.information(
@@ -613,3 +863,24 @@ class BatchQTExportDialog(QDialog):
             )
             if reply == QMessageBox.Yes:
                 open_path_in_os(open_target_dir)
+
+    def closeEvent(self, event):
+        if self._export_worker and self._export_worker.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "Export In Progress",
+                "A QuickTime export is currently running.\n\nCancel the export and close this window?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+            self._close_after_cancel = True
+            self._on_cancel_batch_export()
+            event.ignore()
+            return
+        for w in (self._preview_worker, self._inspect_worker):
+            if w and w.isRunning():
+                w.wait(2000)
+        super().closeEvent(event)

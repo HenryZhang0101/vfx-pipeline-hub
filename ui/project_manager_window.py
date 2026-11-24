@@ -760,19 +760,35 @@ class ProjectManagerWindow(QMainWindow):
             default_shot_id=default_sid,
             new_shot_mode=new_shot_mode,
         )
-        if dlg.exec_() == QDialog.Accepted:
-            ing_sid = dlg.ingested_shot_id
-            if ing_sid:
-                self.repo.invalidate_media_cache(shot_id=ing_sid, project=self.project)
-                sh_obj = self.project.get_shot(ing_sid)
-                if sh_obj:
-                    if not sh_obj.name:
-                        sh_obj.name = f"{ing_sid}_plate"
-                    if sh_obj.status == "Pending":
-                        sh_obj.status = "WIP"
-                    self.current_shot = sh_obj
-                self.save_shots_session(show_toast=False, write_excel=False)
-            self.refresh_all()
+        dlg.setWindowModality(Qt.NonModal)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        dlg.widget.ingest_completed.connect(self._on_media_ingest_completed)
+
+        open_dialogs = getattr(self, "_open_tool_dialogs", None)
+        if open_dialogs is None:
+            open_dialogs = []
+            self._open_tool_dialogs = open_dialogs
+        open_dialogs.append(dlg)
+        dlg.destroyed.connect(lambda _=None, d=dlg: open_dialogs.remove(d) if d in open_dialogs else None)
+
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_media_ingest_completed(self, ing_sid: str, _target_dir: str = ""):
+        if not self.project:
+            return
+        if ing_sid:
+            self.repo.invalidate_media_cache(shot_id=ing_sid, project=self.project)
+            sh_obj = self.project.get_shot(ing_sid)
+            if sh_obj:
+                if not sh_obj.name:
+                    sh_obj.name = f"{ing_sid}_plate"
+                if sh_obj.status == "Pending":
+                    sh_obj.status = "WIP"
+                self.current_shot = sh_obj
+            self.save_shots_session(show_toast=False, write_excel=False)
+        self.refresh_all()
 
     def _on_open_project_settings(self, initial_page: str = ""):
         if not self.project:
@@ -977,6 +993,13 @@ class ProjectManagerWindow(QMainWindow):
         dlg.exec_()
 
     def closeEvent(self, event):
+        for dlg in list(getattr(self, "_open_tool_dialogs", []) or []):
+            try:
+                if dlg and not dlg.close():
+                    event.ignore()
+                    return
+            except RuntimeError:
+                pass
         self._flush_json_autosave()
         self._selection_timer.stop()
         self._media_scan_worker.request_stop()

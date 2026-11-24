@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
@@ -720,34 +722,44 @@ class SlateDeliveryTool(BaseToolPlugin):
         mode: str = "qt_review",
         include_slate: bool = True,
         crf: int = 16,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> Tuple[bool, str]:
         r"""
         Encodes a single clip (either Image Sequence or Movie) to QuickTime:
         - `mode="qt_review"`: H.264 (`libx264 -crf 16 -pix_fmt yuv420p`), default `include_slate=True` (Frame 1000 Slate + Frames 1001..N).
         - `mode="qt_delivery"`: Apple ProRes 4444 (`prores_ks -profile:v 4 -vendor apl0 -pix_fmt yuva444p10le`), default `include_slate=False`.
         """
+        if cancel_check and cancel_check():
+            return False, "Cancelled"
+
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         ffmpeg_exe = self.get_ffmpeg()
         is_seq = bool(clip_info.get("is_sequence", False))
-        ext = clip_info.get("ext", "").lower()
         width = int(clip_info.get("width", 1920))
         height = int(clip_info.get("height", 1080))
         fps_float = float(clip_info.get("fps_float", 24.0))
         fps_rational = str(clip_info.get("fps_rational", "24/1"))
         start_frame = int(clip_info.get("start_frame", 1001))
         has_audio = bool(clip_info.get("has_audio", False)) and not is_seq
+        base_frames = int(clip_info.get("frame_count", 0) or 0)
+        total_frames = max(0, base_frames + (1 if include_slate and base_frames > 0 else 0))
 
         # Timecode starts at 1000 if 1-frame slate is prepended, otherwise start_frame (1001)
         tc_start_frame = (start_frame - 1) if include_slate else start_frame
         tc_str = frame_to_smpte_timecode(tc_start_frame, fps_float)
 
         with tempfile.TemporaryDirectory(prefix="vfx_qt_export_") as tmpdir:
-            cmd = [ffmpeg_exe, "-y"]
+            cmd = [ffmpeg_exe, "-y", "-nostats", "-progress", "pipe:1"]
 
             # Input 0: Optional 1-frame Slate PNG
             if include_slate:
+                if progress_callback:
+                    progress_callback(0, total_frames, "Rendering slate...")
                 slate_png = os.path.join(tmpdir, "slate_1000.png")
                 self.generate_slate_preview_png(clip_info, slate_png)
+                if cancel_check and cancel_check():
+                    return False, "Cancelled"
                 cmd.extend([
                     "-loop", "1",
                     "-framerate", fps_rational,
@@ -819,15 +831,85 @@ class SlateDeliveryTool(BaseToolPlugin):
                 output_path,
             ])
 
-            proc = subprocess.run(
+            if progress_callback:
+                progress_callback(0, total_frames, "Encoding...")
+
+            proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                bufsize=1,
                 creationflags=_subprocess_flags(),
             )
+
+            stderr_chunks: List[str] = []
+
+            def _drain_stderr() -> None:
+                if proc.stderr is None:
+                    return
+                try:
+                    for line in proc.stderr:
+                        stderr_chunks.append(line)
+                except Exception:
+                    pass
+
+            def _read_progress() -> None:
+                if proc.stdout is None:
+                    return
+                try:
+                    for raw_line in proc.stdout:
+                        line = raw_line.strip()
+                        if line.startswith("frame="):
+                            val = line.split("=", 1)[1].strip()
+                            if val.isdigit() and progress_callback:
+                                done_f = int(val)
+                                if total_frames > 0:
+                                    pct = min(99, int(round((done_f / total_frames) * 100)))
+                                    progress_callback(done_f, total_frames, f"Encoding {pct}% ({done_f}/{total_frames})")
+                                else:
+                                    progress_callback(done_f, 0, f"Encoding frame {done_f}...")
+                except Exception:
+                    pass
+
+            t_err = threading.Thread(target=_drain_stderr, daemon=True)
+            t_out = threading.Thread(target=_read_progress, daemon=True)
+            t_err.start()
+            t_out.start()
+
+            cancelled = False
+            while proc.poll() is None:
+                if cancel_check and cancel_check():
+                    cancelled = True
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2.0)
+                    except Exception:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=2.0)
+                        except Exception:
+                            pass
+                    break
+                time.sleep(0.1)
+
+            t_err.join(timeout=2.0)
+            t_out.join(timeout=2.0)
+
+            if cancelled:
+                try:
+                    if os.path.isfile(output_path):
+                        os.remove(output_path)
+                except OSError:
+                    pass
+                return False, "Cancelled"
+
             if proc.returncode != 0:
-                return False, f"FFmpeg exited with code {proc.returncode}:\n{proc.stderr[-800:]}"
+                err_text = "".join(stderr_chunks)[-800:]
+                return False, f"FFmpeg exited with code {proc.returncode}:\n{err_text}"
+
+            if progress_callback:
+                progress_callback(total_frames, total_frames, "Done")
 
         return True, output_path
 

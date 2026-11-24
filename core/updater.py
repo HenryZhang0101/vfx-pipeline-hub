@@ -241,6 +241,70 @@ def _normalize_command_scripts(install_root: str) -> None:
             pass
 
 
+def _resolve_utility_dirs() -> list:
+    if sys.platform == "win32":
+        dirs = [r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Fusion\Scripts\Utility"]
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            dirs.append(
+                os.path.join(
+                    appdata,
+                    "Blackmagic Design",
+                    "DaVinci Resolve",
+                    "Support",
+                    "Fusion",
+                    "Scripts",
+                    "Utility",
+                )
+            )
+        return dirs
+    elif sys.platform == "darwin":
+        return [
+            "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility",
+            os.path.expanduser(
+                "~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
+            ),
+        ]
+    return [
+        "/opt/resolve/Fusion/Scripts/Utility",
+        os.path.expanduser("~/.local/share/DaVinciResolve/Fusion/Scripts/Utility"),
+    ]
+
+
+def _refresh_installed_resolve_shims(
+    install_root: str,
+    utility_dirs: Optional[list] = None,
+) -> int:
+    """
+    Best-effort refresh of any already-installed DaVinci Resolve Utility shim
+    (`VFX_Pipeline_Hub.py`) from `<install_root>/integrations/resolve/VFX_Pipeline_Hub.py`.
+    Never creates new Resolve installs and silently skips unwritable system folders.
+    """
+    template_path = os.path.join(install_root, "integrations", "resolve", "VFX_Pipeline_Hub.py")
+    if not os.path.isfile(template_path):
+        return 0
+    try:
+        with open(template_path, "r", encoding="utf-8") as f:
+            rendered = f.read().replace("__PIPELINE_ROOT__", os.path.normpath(install_root))
+    except OSError:
+        return 0
+
+    refreshed = 0
+    for util_dir in (utility_dirs if utility_dirs is not None else _resolve_utility_dirs()):
+        if not util_dir:
+            continue
+        dest = os.path.join(util_dir, "VFX_Pipeline_Hub.py")
+        if not os.path.isfile(dest):
+            continue
+        try:
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(rendered)
+            refreshed += 1
+        except OSError:
+            pass
+    return refreshed
+
+
 def download_and_apply_update(
     update_info: UpdateInfo,
     install_root: str = PIPELINE_ROOT,
@@ -328,6 +392,10 @@ def download_and_apply_update(
             except Exception:
                 pass
             return False, f"Failed to apply update (rolled back to previous version): {e}"
+
+        # 4b. Best-effort refresh of any already-installed DaVinci Resolve Utility shim
+        _emit(0, 0, "Refreshing external integrations...")
+        _refresh_installed_resolve_shims(install_root)
 
         # 5. On macOS .venv_mac, sync requirements.txt if present
         if sys.platform == "darwin":
